@@ -1,0 +1,352 @@
+#!/usr/bin/env python3
+# /// script
+# requires-python = ">=3.11"
+# dependencies = []
+# ///
+"""steer — inject the harness rule that applies to what the agent is about to do.
+
+Every prompt is scored against a small catalog of rule files with the OpenRouter
+Decisions API (`google/gemini-decision-1` by default), which returns a calibrated
+probability per rule in one ~0.4 s call. The winning rule's body is injected into
+the turn as one short block. Everything else is left alone.
+
+    steer rules [--json]              what would be scored, and from where
+    steer lint                        validate rule files (exit 1 on problems)
+    steer eval "kill the stuck worker"   dry run: rule, probability, latency, cost
+    steer inject [--claude] [--json]  read a prompt on stdin, print the injection
+
+    echo '{"prompt":"kill the stuck worker"}' | steer inject
+
+Rule file (`*.md`, anywhere under the rules dir):
+
+    ---
+    rule: safe-kill
+    when: The agent is about to kill processes by name or pattern.
+    threshold: 0.5          # optional, overrides --threshold for this rule
+    enabled: true           # optional, default true
+    ---
+    Body: the instruction injected verbatim when the rule wins.
+
+Fail-open by design: no key, no network, a timeout or a malformed answer all
+print nothing and exit 0, so the agent's turn is never blocked by the router.
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import sys
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+ENDPOINT = "https://openrouter.ai/api/alpha/decisions"
+DEFAULT_MODEL = os.environ.get("STEER_MODEL", "google/gemini-decision-1")
+DEFAULT_THRESHOLD = float(os.environ.get("STEER_THRESHOLD", "0.5"))
+DEFAULT_TIMEOUT = float(os.environ.get("STEER_TIMEOUT", "4"))
+RULES_DIR = Path(os.environ.get("STEER_RULES", Path.home() / ".config/steer/rules")).expanduser()
+ENV_FILE = Path(os.environ.get("STEER_ENV_FILE", Path.home() / ".config/steer/env")).expanduser()
+STATE_DIR = Path(os.environ.get("STEER_STATE", Path.home() / ".local/state/steer")).expanduser()
+NONE_KEY = "none"
+MAX_STATE_CHARS = 4000
+
+
+# ------------------------------------------------------------------ rule files
+def parse_front_matter(text: str) -> tuple[dict, str]:
+    """Tiny YAML subset: `key: value` lines, `#` comments, optional quotes."""
+    if not text.startswith("---"):
+        return {}, text
+    end = text.find("\n---", 3)
+    if end == -1:
+        return {}, text
+    head, body = text[3:end], text[end + 4:]
+    fm: dict[str, str] = {}
+    for line in head.splitlines():
+        line = line.split(" #", 1)[0].strip() if not line.strip().startswith("#") else ""
+        if not line or ":" not in line:
+            continue
+        k, v = line.split(":", 1)
+        v = v.strip().strip('"').strip("'")
+        fm[k.strip()] = v
+    return fm, body.lstrip("\n")
+
+
+def load_rules(rules_dir: Path) -> tuple[list[dict], list[str]]:
+    rules, problems = [], []
+    paths = sorted(rules_dir.rglob("*.md")) if rules_dir.is_dir() else []
+    if not paths:
+        problems.append(f"no rule files under {rules_dir}")
+    seen: dict[str, Path] = {}
+    for p in paths:
+        fm, body = parse_front_matter(p.read_text(encoding="utf-8"))
+        slug = fm.get("rule", "").strip()
+        when = fm.get("when", "").strip()
+        rel = p.relative_to(rules_dir).as_posix()
+        if not slug:
+            problems.append(f"{rel}: missing `rule:` slug")
+            continue
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", slug):
+            problems.append(f"{rel}: `rule: {slug}` must match [A-Za-z0-9_-]{{1,64}}")
+            continue
+        if slug == NONE_KEY:
+            problems.append(f"{rel}: `none` is reserved")
+            continue
+        if slug in seen:
+            problems.append(f"{rel}: duplicate rule `{slug}` (also {seen[slug]})")
+            continue
+        seen[slug] = rel
+        if not when:
+            problems.append(f"{rel}: missing `when:` (the trigger the model is asked about)")
+            continue
+        if not body.strip():
+            problems.append(f"{rel}: empty body — nothing would be injected")
+            continue
+        if fm.get("enabled", "true").lower() in ("false", "no", "0"):
+            continue
+        try:
+            threshold = float(fm.get("threshold", DEFAULT_THRESHOLD))
+        except ValueError:
+            problems.append(f"{rel}: threshold is not a number")
+            continue
+        rules.append({"rule": slug, "when": when, "body": body.strip(), "threshold": threshold, "path": rel})
+    return rules, problems
+
+
+# --------------------------------------------------------------------- secrets
+def api_key() -> str | None:
+    for var in ("STEER_API_KEY", "OPENROUTER_API_KEY"):
+        if os.environ.get(var):
+            return os.environ[var].strip()
+    if ENV_FILE.is_file():
+        for line in ENV_FILE.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            if k.strip() in ("STEER_API_KEY", "OPENROUTER_API_KEY") and v.strip():
+                return v.strip().strip('"').strip("'")
+    return None
+
+
+# --------------------------------------------------------------------- scoring
+def score(prompt: str, rules: list[dict], key: str, model: str, timeout: float) -> dict:
+    criteria = {r["rule"]: r["when"] for r in rules}
+    criteria[NONE_KEY] = "none of the rules above apply — the request is ordinary work with no harness rule to follow"
+    body = {
+        "model": model,
+        "state": [prompt[:MAX_STATE_CHARS]],
+        "questions": {"rule": {
+            "type": "choice",
+            "instructions": "Which harness rule governs what the agent is about to do? "
+                            f"Pick `{NONE_KEY}` unless one rule's condition is directly about to happen.",
+            "criteria": criteria,
+        }},
+    }
+    req = urllib.request.Request(ENDPOINT, data=json.dumps(body).encode(),
+                                 headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"})
+    t0 = time.time()
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        d = json.load(r)
+    ans = (d.get("answers") or {}).get("rule") or {}
+    if ans.get("type") != "choice" or not ans.get("choice"):
+        raise RuntimeError(f"unexpected answer: {ans.get('type')!r}")
+    probs = ans.get("probabilities") or {}
+    usage = d.get("usage") or {}
+    return {"pick": ans["choice"], "p": float(probs.get(ans["choice"], ans.get("confidence", 0.0))),
+            "latency_ms": int((time.time() - t0) * 1000), "cost": usage.get("cost", 0.0),
+            "tokens": usage.get("input_tokens", 0), "model": d.get("model", model)}
+
+
+# ----------------------------------------------------------------------- state
+def seen_recently(prompt: str, rule: str, ttl: float) -> bool:
+    if ttl <= 0:  # suppression disabled: never record, never suppress
+        return False
+    f = STATE_DIR / "seen.json"
+    now = time.time()
+    try:
+        data = json.loads(f.read_text())
+    except Exception:
+        data = {}
+    data = {k: v for k, v in data.items() if isinstance(v, (int, float)) and now - v < 86400}
+    h = hashlib.sha256(f"{rule}\0{prompt}".encode()).hexdigest()[:24]
+    hit = h in data and now - data[h] < ttl
+    if not hit:
+        data[h] = now
+        try:
+            STATE_DIR.mkdir(parents=True, exist_ok=True)
+            f.write_text(json.dumps(data))
+        except OSError:
+            pass
+    return hit
+
+
+def log(record: dict) -> None:
+    if os.environ.get("STEER_NO_LOG"):
+        return
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        with (STATE_DIR / "log.jsonl").open("a") as f:
+            f.write(json.dumps(record, separators=(",", ":")) + "\n")
+    except OSError:
+        pass
+
+
+# ---------------------------------------------------------------------- output
+def render(rule: dict, p: float) -> str:
+    return (f'<steer rule="{rule["rule"]}" confidence="{p:.2f}">\n'
+            f"HARNESS RULE (auto-injected for this turn — follow it over routine habit):\n"
+            f"{rule['body']}\n</steer>")
+
+
+def emit(text: str, claude: bool, as_json: bool) -> None:
+    if not text:
+        return
+    if claude:
+        print(json.dumps({"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": text}}))
+    elif as_json:
+        print(json.dumps({"inject": text}))
+    else:
+        print(text)
+
+
+def prompt_from_stdin() -> str:
+    raw = sys.stdin.read()
+    if not raw.strip():
+        return ""
+    try:
+        d = json.loads(raw)
+    except json.JSONDecodeError:
+        return raw.strip()
+    if isinstance(d, str):
+        return d.strip()
+    for k in ("prompt", "text", "message"):
+        v = d.get(k)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    return ""
+
+
+# -------------------------------------------------------------------- commands
+def cmd_rules(args) -> int:
+    rules, problems = load_rules(Path(args.rules))
+    if args.json:
+        print(json.dumps({"rules": [{k: v for k, v in r.items() if k != "body"} for r in rules],
+                          "problems": problems}, indent=1))
+        return 1 if problems else 0
+    print(f"{len(rules)} rule(s) from {args.rules}")
+    for r in rules:
+        print(f"  {r['rule']:<28} p>={r['threshold']:<4} {r['when'][:80]}")
+    for p in problems:
+        print(f"  ! {p}")
+    return 1 if problems else 0
+
+
+def cmd_lint(args) -> int:
+    rules, problems = load_rules(Path(args.rules))
+    for p in problems:
+        print(f"error: {p}", file=sys.stderr)
+    if problems:
+        return 1
+    print(f"ok: {len(rules)} rule(s) valid in {args.rules}")
+    return 0
+
+
+def cmd_eval(args) -> int:
+    rules, problems = load_rules(Path(args.rules))
+    if problems:
+        for p in problems:
+            print(f"warning: {p}", file=sys.stderr)
+    if not rules:
+        return 1
+    prompt = args.prompt or prompt_from_stdin()
+    if not prompt:
+        print("error: no prompt (pass it as an argument or on stdin)", file=sys.stderr)
+        return 2
+    key = api_key()
+    if not key:
+        print("error: no OPENROUTER_API_KEY / STEER_API_KEY (see --help)", file=sys.stderr)
+        return 3
+    try:
+        s = score(prompt, rules, key, args.model, args.timeout)
+    except Exception as e:
+        print(f"error: {type(e).__name__}: {e}", file=sys.stderr)
+        return 4
+    hit = next((r for r in rules if r["rule"] == s["pick"]), None)
+    if args.json:
+        print(json.dumps({**s, "threshold": hit["threshold"] if hit else None,
+                          "would_inject": bool(hit and s["p"] >= hit["threshold"])}, indent=1))
+    else:
+        print(f"pick      {s['pick']}  p={s['p']:.2f}  ({s['latency_ms']} ms, ${s['cost']:.6f}, {s['model']})")
+        if hit:
+            print(f"threshold {hit['threshold']}  -> {'INJECT' if s['p'] >= hit['threshold'] else 'skip'}")
+    return 0
+
+
+def cmd_inject(args) -> int:
+    prompt = prompt_from_stdin()
+    if not prompt:
+        return 0
+    rules, _ = load_rules(Path(args.rules))
+    if not rules:
+        return 0
+    key = api_key()
+    if not key:
+        log({"ts": int(time.time()), "skip": "no-key"})
+        return 0
+    try:
+        s = score(prompt, rules, key, args.model, args.timeout)
+    except Exception as e:
+        log({"ts": int(time.time()), "skip": f"{type(e).__name__}: {e}"[:200]})
+        return 0
+    rule = next((r for r in rules if r["rule"] == s["pick"]), None)
+    inject = bool(rule and s["p"] >= rule["threshold"])
+    if inject and not args.no_once:
+        ttl = float(os.environ.get("STEER_TTL", "900"))
+        if seen_recently(prompt, rule["rule"], ttl):
+            inject = False
+    text = render(rule, s["p"]) if inject else ""
+    log({"ts": int(time.time()), "pick": s["pick"], "p": round(s["p"], 3), "injected": inject,
+         "rule": rule["rule"] if rule else None, "latency_ms": s["latency_ms"], "cost": s["cost"],
+         "prompt_sha": hashlib.sha256(prompt.encode()).hexdigest()[:12]})
+    emit(text, args.claude, args.json)
+    return 0
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(prog="steer", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--rules", default=str(RULES_DIR), help="rule directory (default %(default)s)")
+    ap.add_argument("--model", default=DEFAULT_MODEL, help="Decisions model (default %(default)s)")
+    ap.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT, help="request timeout seconds")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("rules", help="list loaded rules")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(fn=cmd_rules)
+
+    p = sub.add_parser("lint", help="validate rule files")
+    p.set_defaults(fn=cmd_lint)
+
+    p = sub.add_parser("eval", help="dry run against one prompt")
+    p.add_argument("prompt", nargs="?")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(fn=cmd_eval)
+
+    p = sub.add_parser("inject", help="score stdin's prompt and print the injection")
+    p.add_argument("--claude", action="store_true", help="emit a Claude Code UserPromptSubmit payload")
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--no-once", action="store_true", help="ignore the duplicate-suppression cache")
+    p.set_defaults(fn=cmd_inject)
+
+    args = ap.parse_args()
+    try:
+        return args.fn(args)
+    except BrokenPipeError:
+        return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
