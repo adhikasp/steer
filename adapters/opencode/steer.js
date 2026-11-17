@@ -24,6 +24,9 @@ function inject(prompt, sessionID) {
     input: JSON.stringify({ prompt, session_id: sessionID }),
     encoding: "utf8",
     timeout: Number(process.env.STEER_TIMEOUT_MS || 6000),
+    // On Windows the plugins run inside `opencode serve --service`, a daemon with no
+    // console attached, so without this every prompt pops a console window for ~1 s.
+    windowsHide: true,
   });
   if (r.error || r.status !== 0) return "";
   return (r.stdout || "").trim();
