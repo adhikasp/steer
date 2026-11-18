@@ -44,12 +44,35 @@ import urllib.request
 from pathlib import Path
 
 ENDPOINT = "https://openrouter.ai/api/alpha/decisions"
-DEFAULT_MODEL = os.environ.get("STEER_MODEL", "google/gemini-decision-1")
-DEFAULT_THRESHOLD = float(os.environ.get("STEER_THRESHOLD", "0.5"))
-DEFAULT_TIMEOUT = float(os.environ.get("STEER_TIMEOUT", "4"))
 RULES_DIR = Path(os.environ.get("STEER_RULES", Path.home() / ".config/steer/rules")).expanduser()
 ENV_FILE = Path(os.environ.get("STEER_ENV_FILE", Path.home() / ".config/steer/env")).expanduser()
 STATE_DIR = Path(os.environ.get("STEER_STATE", Path.home() / ".local/state/steer")).expanduser()
+
+
+def file_env() -> dict[str, str]:
+    """`KEY=VALUE` lines from ENV_FILE — the same machine-local config file the key lives in."""
+    out: dict[str, str] = {}
+    if ENV_FILE.is_file():
+        for line in ENV_FILE.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            out[k.strip()] = v.strip().strip('"').strip("'")
+    return out
+
+
+_FILE_ENV = file_env()
+
+
+def setting(name: str, default: str) -> str:
+    """Process environment wins, then ENV_FILE, then the built-in default."""
+    return os.environ.get(name) or _FILE_ENV.get(name) or default
+
+
+DEFAULT_MODEL = setting("STEER_MODEL", "google/gemini-decision-1")
+DEFAULT_THRESHOLD = float(setting("STEER_THRESHOLD", "0.5"))
+DEFAULT_TIMEOUT = float(setting("STEER_TIMEOUT", "4"))
 NONE_KEY = "none"
 MAX_STATE_CHARS = 4000
 
@@ -120,14 +143,9 @@ def api_key() -> str | None:
     for var in ("STEER_API_KEY", "OPENROUTER_API_KEY"):
         if os.environ.get(var):
             return os.environ[var].strip()
-    if ENV_FILE.is_file():
-        for line in ENV_FILE.read_text().splitlines():
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            k, v = line.split("=", 1)
-            if k.strip() in ("STEER_API_KEY", "OPENROUTER_API_KEY") and v.strip():
-                return v.strip().strip('"').strip("'")
+    for var in ("STEER_API_KEY", "OPENROUTER_API_KEY"):
+        if _FILE_ENV.get(var):
+            return _FILE_ENV[var]
     return None
 
 
@@ -304,7 +322,7 @@ def cmd_inject(args) -> int:
     rule = next((r for r in rules if r["rule"] == s["pick"]), None)
     inject = bool(rule and s["p"] >= rule["threshold"])
     if inject and not args.no_once:
-        ttl = float(os.environ.get("STEER_TTL", "900"))
+        ttl = float(setting("STEER_TTL", "900"))
         if seen_recently(prompt, rule["rule"], ttl):
             inject = False
     text = render(rule, s["p"]) if inject else ""

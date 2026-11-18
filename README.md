@@ -61,6 +61,11 @@ Environment:
 | `STEER_TTL` | `900` | seconds to suppress re-injecting the same rule for the same prompt |
 | `STEER_NO_LOG` | unset | set to skip `~/.local/state/steer/log.jsonl` |
 
+The key and the `STEER_MODEL` / `STEER_THRESHOLD` / `STEER_TIMEOUT` / `STEER_TTL` settings can all live
+in `~/.config/steer/env` as `KEY=VALUE` lines, which is how a machine picks its model without editing a
+shell profile (the process environment still wins). `STEER_RULES`, `STEER_STATE`, `STEER_ENV_FILE` and
+`STEER_BIN` are paths for tests and adapters and are env-only.
+
 ## Rule files
 
 One markdown file per rule, front matter plus the text to inject. Any file under the rules directory
